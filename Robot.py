@@ -397,7 +397,17 @@ def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h):
     robot_step1  = robot_y_steps  - robot_x_steps
     robot_step2  = robot_y_steps  + robot_x_steps
 
-    return target_step1 - robot_step1, target_step2 - robot_step2
+    steps1 = target_step1 - robot_step1
+    steps2 = target_step2 - robot_step2
+    if(steps1 >= 0):
+        steps1 = 2000
+    else:
+        steps1 = -2000
+    if (steps2 >= 0):
+        steps2 = 2000
+    else:
+        steps2 = -2000
+    return steps1, steps2
 
 
 # =============================================================
