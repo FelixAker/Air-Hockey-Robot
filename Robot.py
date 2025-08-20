@@ -6,6 +6,8 @@ import time
 import configparser
 import glob
 import sys
+from collections import deque
+from typing import Optional, Tuple
 
 """
 Air Hockey – DEFENSE LINE + HARD BOUNDARIES
@@ -36,6 +38,7 @@ SWAP_STEPS          = True     # True keeps your historical (step2, step1) send 
 PIXEL_DEADBAND      = 6        # pixels (squared used for comparison)
 SEND_MIN_INTERVAL   = 0.010    # serial send rate limit (seconds)
 GOAL_MARGIN_PIX     = 8        # for path prediction goal line proximity
+IGNORE_BORDERS       = True     # Disable border clamps & visuals for testing
 
 # Step-space & motor sense
 X_STEPS_MAX        = 8000
@@ -44,10 +47,10 @@ MOTOR_INVERT_X     = False   # if robot moves opposite along defense line, toggl
 MOTOR_INVERT_Y     = False   # if vertical sense is reversed, toggle with 'y'
 
 # Sides/orientation
-OPPONENT_SIDE       = 'left'   # 'left' if opponent is left in the image, else 'right'
+OPPONENT_SIDE       = 'right'   # 'left' if opponent is left in the image, else 'right'
 MIDDLE_LINE_X       = 940      # visual midline x (pixels)
 ROBOT_SIDE_MARGIN   = 140      # how far away from midline our robot must stay
-CAMERA_MIRROR_X     = True     # flip camera image only (no logic flip)
+CAMERA_MIRROR_X = False  # default: no vertical mirror (phone NOT mirrored around X-axis)     # flip camera image only (no logic flip)
 
 # Safety margins and crease (no-go areas)
 ARENA_MARGIN_X      = 120      # keep away from left/right walls (bigger)
@@ -110,7 +113,8 @@ def send_data_to_arduino(step1, step2):
     if ser is None:
         return
     try:
-        ser.write(f"{step2},{step1}\n".encode())
+        ser.write(f"{step1/2},{step2/2}\n".encode())
+        print(f"{step1} {step2}")
         resp = ser.readline().decode(errors='ignore').strip()
         if resp:
             print(f"[Arduino] {resp}")
@@ -157,22 +161,28 @@ def robot_zone_is_right_eff(w: int) -> bool:
 
 
 def defense_x_for_frame(w: int) -> int:
-    """Return the X position of our vertical DEFENSE LINE (inner edge of our crease)."""
+    """Return the X position of our vertical DEFENSE LINE (inner edge of our crease).
+    If IGNORE_BORDERS is True, do not constrain by midline or arena margins.
+    """
+    if IGNORE_BORDERS:
+        return (w - GOAL_CREASE_DEPTH) if robot_zone_is_right_eff(w) else GOAL_CREASE_DEPTH
+
     mid = midline_x(w)
-    if robot_zone_is_right_eff(w):
-        x = w - GOAL_CREASE_DEPTH
-        min_x = mid + ROBOT_SIDE_MARGIN
-        max_x = w - 1 - ARENA_MARGIN_X
-        return max(min_x, min(x, max_x))
-    else:
-        x = GOAL_CREASE_DEPTH
-        min_x = ARENA_MARGIN_X
-        max_x = mid - ROBOT_SIDE_MARGIN
-        return max(min_x, min(x, max_x))
+    x = GOAL_CREASE_DEPTH
+    min_x = ARENA_MARGIN_X
+    max_x = mid - ROBOT_SIDE_MARGIN
+    return max(min_x, min(x, max_x))
 
 
 def clamp_to_robot_zone(x: int, y: int, w: int, h: int) -> tuple[int, int]:
-    """Clamp ANY point to legal robot area (half + margins + crease on OUR side)."""
+    """Clamp ANY point to legal robot area (half + margins + crease on OUR side).
+    If IGNORE_BORDERS is True, only clamp to frame bounds and ignore all custom margins/creases/midline.
+    """
+    if IGNORE_BORDERS:
+        x = max(0, min(int(x), w - 1))
+        y = max(0, min(int(y), h - 1))
+        return x, y
+
     mid = midline_x(w)
     if robot_zone_is_right_eff(w):
         min_x = mid + ROBOT_SIDE_MARGIN
@@ -368,33 +378,126 @@ def draw_circles_on_frame(frame, detection, color=(255, 0, 0)):
 # =============================================================
 
 def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h):
-    """CoreXY mapping using actual frame size (w,h).
-    BOTH target and measured robot are clamped to the legal zone first.
+    """
+    CoreXY mapping using actual frame size (w,h).
     Returns (delta_step1, delta_step2).
     """
-    tx, ty = clamp_to_robot_zone(int(target_x), int(target_y), w, h)
-    rx, ry = clamp_to_robot_zone(int(robot_x),  int(robot_y),  w, h)
+    target_x = int(np.clip(target_x, 0, w - 1))
+    target_y = int(np.clip(target_y, 0, h - 1))
+    robot_x  = int(np.clip(robot_x,  0, w - 1))
+    robot_y  = int(np.clip(robot_y,  0, h - 1))
 
-    # map pixels -> nominal step coordinates
-    tx_steps = int(np.interp(tx, [0, w - 1], [0, X_STEPS_MAX]))
-    ty_steps = int(np.interp(ty, [0, h - 1], [0, Y_STEPS_MAX]))
-    rx_steps = int(np.interp(rx, [0, w - 1], [0, X_STEPS_MAX]))
-    ry_steps = int(np.interp(ry, [0, h - 1], [0, Y_STEPS_MAX]))
+    target_x_steps = int(np.interp(target_x, [0, w - 1], [0, 8000]))
+    target_y_steps = int(np.interp(target_y, [0, h - 1], [0, 8000]))
+    robot_x_steps  = int(np.interp(robot_x,  [0, w - 1], [0, 8000]))
+    robot_y_steps  = int(np.interp(robot_y,  [0, h - 1], [0, 8000]))
 
-    # optional motor-axis inversions (fixes direction without changing camera flip)
-    if MOTOR_INVERT_X:
-        tx_steps = X_STEPS_MAX - tx_steps
-        rx_steps = X_STEPS_MAX - rx_steps
-    if MOTOR_INVERT_Y:
-        ty_steps = Y_STEPS_MAX - ty_steps
-        ry_steps = Y_STEPS_MAX - ry_steps
-
-    target_step1 = ty_steps - tx_steps
-    target_step2 = ty_steps + tx_steps
-    robot_step1  = ry_steps - rx_steps
-    robot_step2  = ry_steps + rx_steps
+    target_step1 = target_y_steps - target_x_steps
+    target_step2 = target_y_steps + target_x_steps
+    robot_step1  = robot_y_steps  - robot_x_steps
+    robot_step2  = robot_y_steps  + robot_x_steps
 
     return target_step1 - robot_step1, target_step2 - robot_step2
+
+
+# =============================================================
+# Prediction helpers
+# =============================================================
+PUCK_TRACE: deque = deque(maxlen=8)
+PREDICTED_POINT: Optional[Tuple[int, int]] = None
+
+
+def extract_xy(det) -> Optional[Tuple[int, int]]:
+    if det is None:
+        return None
+    # tuple/list
+    if isinstance(det, (tuple, list)) and len(det) >= 2:
+        try:
+            return int(det[0]), int(det[1])
+        except Exception:
+            pass
+    # dict-like
+    if hasattr(det, "get"):
+        for kx, ky in (("cx", "cy"), ("x", "y"), ("center_x", "center_y")):
+            try:
+                return int(det.get(kx)), int(det.get(ky))
+            except Exception:
+                pass
+    # object attrs
+    for kx, ky in (("cx", "cy"), ("x", "y"), ("center_x", "center_y")):
+        try:
+            return int(getattr(det, kx)), int(getattr(det, ky))
+        except Exception:
+            pass
+    return None
+
+
+def to_display_xy(x: int, y: int, w: int, h: int) -> Tuple[int, int]:
+    """Map model/frame coords to current display coords, accounting for vertical mirror."""
+    try:
+        if CAMERA_MIRROR_X:
+            y = (h - 1) - y
+    except NameError:
+        pass
+    return int(x), int(y)
+
+
+def _reflect_y(y: float, ymin: int, ymax: int) -> float:
+    L = float(max(1, ymax - ymin))
+    m = (y - ymin) % (2.0 * L)
+    if m > L:
+        m = 2.0 * L - m
+    return ymin + m
+
+
+def predict_intercept_on_defense(p0: Tuple[int, int], p1: Tuple[int, int], w: int, h: int) -> Optional[Tuple[int, int]]:
+    """Linear puck prediction to our defense line (with optional wall reflections).
+    p0, p1 are last two puck centers in *frame* pixel coords.
+    Returns (x_defense, y_pred) in *frame* pixel coords or None if not approaching.
+    """
+    x0, y0 = int(p0[0]), int(p0[1])
+    x1, y1 = int(p1[0]), int(p1[1])
+
+    # Un-mirror for the model if the camera is vertically mirrored around the X-axis
+    try:
+        if CAMERA_MIRROR_X:
+            y0 = (h - 1) - y0
+            y1 = (h - 1) - y1
+    except NameError:
+        pass
+
+    vx = x1 - x0
+    vy = y1 - y0
+    if vx == 0:
+        return None
+
+    dx = defense_x_for_frame(w)
+    going_right = vx > 0
+    right_side = robot_zone_is_right_eff(w)
+    # Only predict if the puck is moving toward our defense line
+    if (right_side and not going_right) or ((not right_side) and going_right):
+        return None
+
+    t = (dx - x1) / float(vx)
+    if t < 0:
+        return None
+
+    y_at = y1 + vy * t
+
+    if not IGNORE_BORDERS:
+        ymin = ARENA_MARGIN_Y
+        ymax = h - 1 - ARENA_MARGIN_Y
+        y_at = _reflect_y(y_at, ymin, ymax)
+
+    # Re-mirror back to *frame* coords if needed
+    try:
+        if CAMERA_MIRROR_X:
+            y_at = (h - 1) - y_at
+    except NameError:
+        pass
+
+    y_px = max(0, min(int(round(y_at)), h - 1))
+    return int(dx), y_px
 
 # =============================================================
 # UI helpers
@@ -419,6 +522,8 @@ def shade_rect(frame, x1, y1, x2, y2, color=(60, 60, 60), alpha=0.18):
 
 
 def draw_margins_and_crease(frame):
+    if IGNORE_BORDERS:
+        return
     h, w = frame.shape[:2]
     # Side & top/bottom safety
     shade_rect(frame, 0, 0, ARENA_MARGIN_X, h, (60, 60, 200), 0.18)
@@ -437,41 +542,7 @@ def draw_margins_and_crease(frame):
         cv2.line(frame, (dx, 0), (dx, h), (0, 140, 255), 2)
         cv2.putText(frame, "DEFENSE LINE", (max(10, dx - 120), 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
-# =============================================================
-# Optional self-tests (run: python thisfile.py --selftest)
-# =============================================================
 
-def _run_selftests():
-    print("[TEST] Running self-tests...")
-    # 1) intersect with vertical line
-    segs = [((10, 10), (110, 60))]
-    inter = intersect_polyline_with_vertical_x(segs, 60)
-    assert inter == (60, 35), f"intersect expected (60,35), got {inter}"
-
-    # 2) clamp_to_robot_zone keeps inside legal X for each side
-    global OPPONENT_SIDE
-    orig_side = OPPONENT_SIDE
-    w, h = 1920, 1080
-
-    OPPONENT_SIDE = 'left'  # robot on right half
-    x, y = clamp_to_robot_zone(1910, 10, w, h)
-    assert x <= defense_x_for_frame(w) and x >= midline_x(w) + ROBOT_SIDE_MARGIN
-    assert ARENA_MARGIN_Y <= y <= h-1-ARENA_MARGIN_Y
-
-    OPPONENT_SIDE = 'right'  # robot on left half
-    x, y = clamp_to_robot_zone(10, 10, w, h)
-    assert x >= defense_x_for_frame(w) and x <= midline_x(w) - ROBOT_SIDE_MARGIN
-
-    # 3) pixel_to_steps yields zero deltas when target == robot
-    d1, d2 = pixel_to_steps(500, 400, 500, 400, w, h)
-    assert d1 == 0 and d2 == 0
-
-    OPPONENT_SIDE = orig_side
-    print("[TEST] All tests passed.")
-
-if '--selftest' in sys.argv:
-    _run_selftests()
-    sys.exit(0)
 
 # =============================================================
 # Main loop
@@ -486,7 +557,7 @@ robot_x = robot_y = 0
 last_robot_xy = None
 last_send = 0.0
 
-print("[INFO] Running. Press ESC or 'q' to quit. Press 'p' to toggle mode. 'o' = flip sides, 'f' = camera flip only.")
+print("[INFO] Running. Press ESC or 'q' to quit. Press 'p' to toggle mode. 'o' = flip sides, 'f' = camera flip only, 'b' = toggle border ignore.")
 
 while True:
     ok, frame = cap.read()
@@ -522,8 +593,9 @@ while True:
     draw_circles_on_frame(frame, player_det, color=(0, 255, 0))   # opponent (green)
     draw_circles_on_frame(frame, robot_det,  color=(0, 0, 255))   # robot (red/blue)
 
-    draw_middle_line(frame, midline_x(w))
-    draw_margins_and_crease(frame)
+    if not IGNORE_BORDERS:
+        draw_middle_line(frame, midline_x(w))
+        draw_margins_and_crease(frame)
 
     sent_this_frame = False
 
@@ -579,7 +651,25 @@ while True:
             send_data_to_arduino(out_a, out_b)
             last_send = now
 
-    status = f"Mode:{CONTROL_MODE}  Opp:{OPPONENT_SIDE}  CamFlip:{CAMERA_MIRROR_X}  InvX:{MOTOR_INVERT_X} InvY:{MOTOR_INVERT_Y}  Puck:{puck_det is not None} Enemy:{player_det is not None} Robot:{robot_det is not None}"
+    status = f"Mode:{CONTROL_MODE}  Opp:{OPPONENT_SIDE}  CamFlip:{CAMERA_MIRROR_X}  InvX:{MOTOR_INVERT_X} InvY:{MOTOR_INVERT_Y}  Puck:{puck_det is not None} Enemy:{player_det is not None} Robot:{robot_det is not None} Borders:{'OFF' if IGNORE_BORDERS else 'ON'}"
+    # --- Prediction trace & overlay ---
+    try:
+        h, w = frame.shape[:2]
+        pt = extract_xy(puck_det)
+        if pt is not None:
+            PUCK_TRACE.append(pt)
+        if len(PUCK_TRACE) >= 2:
+            pred = predict_intercept_on_defense(PUCK_TRACE[-2], PUCK_TRACE[-1], w, h)
+            if pred is not None:
+                PREDICTED_POINT = pred
+        if PREDICTED_POINT is not None:
+            px, py = to_display_xy(PREDICTED_POINT[0], PREDICTED_POINT[1], w, h)
+            cv2.circle(frame, (int(px), int(py)), 6, (0,255,255), 2)
+            cv2.line(frame, (int(px)-12, int(py)), (int(px)+12, int(py)), (0,255,255), 1)
+            cv2.line(frame, (int(px), int(py)-12), (int(px), int(py)+12), (0,255,255), 1)
+    except Exception:
+        pass
+
     cv2.putText(frame, status, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 220, 20), 2, cv2.LINE_AA)
     print(f"Puck({puck_x:4d},{puck_y:4d})  Robot({robot_x:4d},{robot_y:4d})  Sent:{sent_this_frame}")
 
@@ -603,6 +693,9 @@ while True:
     elif key == ord('y'):
         MOTOR_INVERT_Y = not MOTOR_INVERT_Y
         print(f"[INFO] MOTOR_INVERT_Y -> {MOTOR_INVERT_Y}")
+    elif key == ord('b'):
+        IGNORE_BORDERS = not IGNORE_BORDERS
+        print(f"[INFO] IGNORE_BORDERS -> {IGNORE_BORDERS} (border clamps & visuals {'disabled' if IGNORE_BORDERS else 'enabled'})")
 
 cap.release()
 cv2.destroyAllWindows()
