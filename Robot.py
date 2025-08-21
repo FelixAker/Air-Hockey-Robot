@@ -10,10 +10,12 @@ from collections import deque
 from typing import Optional, Tuple
 
 """
-Air Hockey – DEFENSE LINE + HARD BOUNDARIES
+Air Hockey – DEFENSE LINE + HARD BOUNDARIES + AUTO ATTACK
 - Defend on a vertical line in front of our goal (inner edge of the goal crease)
 - Never command the robot outside its legal zone (midline margin, arena margins, crease)
 - Can switch between 'line' (defense line interception) and 'puck' tracking with 'p'
+- NEW: If puck remains in our half > ATTACK_TRIGGER_SEC, auto-attack engages:
+    * Approach the puck, then push it toward the opponent side.
 
 Notes:
 - Keep SWAP_STEPS=True if your Arduino expects (step2, step1)
@@ -38,7 +40,14 @@ SWAP_STEPS          = True     # True keeps your historical (step2, step1) send 
 PIXEL_DEADBAND      = 6        # pixels (squared used for comparison)
 SEND_MIN_INTERVAL   = 0.010    # serial send rate limit (seconds)
 GOAL_MARGIN_PIX     = 8        # for path prediction goal line proximity
-IGNORE_BORDERS       = True     # Disable border clamps & visuals for testing
+IGNORE_BORDERS      = False    # Disable border clamps & visuals for testing
+
+# Auto-attack parameters
+ATTACK_ENABLE        = True
+ATTACK_TRIGGER_SEC   = 3.0     # time puck must stay in our half to trigger attack
+APPROACH_DIST_PIX    = 40      # if farther than this from puck, approach first
+HIT_PUSH_PIX         = 80      # when close, push this many px toward opponent side
+ATTACK_COOLDOWN_SEC  = 0.8     # minimum time between push targets to avoid oscillation
 
 # Step-space & motor sense
 X_STEPS_MAX        = 8000
@@ -48,14 +57,14 @@ MOTOR_INVERT_Y     = False   # if vertical sense is reversed, toggle with 'y'
 
 # Sides/orientation
 OPPONENT_SIDE       = 'right'   # 'left' if opponent is left in the image, else 'right'
-MIDDLE_LINE_X       = 940      # visual midline x (pixels)
-ROBOT_SIDE_MARGIN   = 140      # how far away from midline our robot must stay
-CAMERA_MIRROR_X = False  # default: no vertical mirror (phone NOT mirrored around X-axis)     # flip camera image only (no logic flip)
+MIDDLE_LINE_X       = 940       # visual midline x (pixels)
+ROBOT_SIDE_MARGIN   = 140       # how far away from midline our robot must stay
+CAMERA_MIRROR_X     = False     # flip camera image only (no logic flip)
 
 # Safety margins and crease (no-go areas)
-ARENA_MARGIN_X      = 120      # keep away from left/right walls (bigger)
+ARENA_MARGIN_X      = 120       # keep away from left/right walls (bigger)
 ARENA_MARGIN_Y      = 140       # keep away from top/bottom rails (bigger)
-GOAL_CREASE_DEPTH   = 260      # depth of the no-go strip in front of a goal (bigger)
+GOAL_CREASE_DEPTH   = 260       # depth of the no-go strip in front of a goal (bigger)
 
 # HSV - puck (blue), player (green), robot (orange)
 PUCK_BANDS = [
@@ -113,7 +122,7 @@ def send_data_to_arduino(step1, step2):
     if ser is None:
         return
     try:
-        ser.write(f"{step1/2},{step2/2}\n".encode())
+        ser.write(f"{step1/3},{step2/3}\n".encode())
         print(f"{step1} {step2}")
         resp = ser.readline().decode(errors='ignore').strip()
         if resp:
@@ -327,7 +336,7 @@ def detect_puck(frame, bands=PUCK_BANDS, min_radius=14, max_radius=90, use_blue_
         if perim <= 0:
             continue
         circularity = 4 * np.pi * area / (perim ** 2)
-        if circularity < 0.35:
+        if circularity < 0.3:
             continue
         (x, y), radius = cv2.minEnclosingCircle(cnt)
         if min_radius <= radius <= max_radius and radius > max_radius_found:
@@ -416,7 +425,6 @@ def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h):
 PUCK_TRACE: deque = deque(maxlen=8)
 PREDICTED_POINT: Optional[Tuple[int, int]] = None
 
-
 def extract_xy(det) -> Optional[Tuple[int, int]]:
     if det is None:
         return None
@@ -461,10 +469,7 @@ def _reflect_y(y: float, ymin: int, ymax: int) -> float:
 
 
 def predict_intercept_on_defense(p0: Tuple[int, int], p1: Tuple[int, int], w: int, h: int) -> Optional[Tuple[int, int]]:
-    """Linear puck prediction to our defense line (with optional wall reflections).
-    p0, p1 are last two puck centers in *frame* pixel coords.
-    Returns (x_defense, y_pred) in *frame* pixel coords or None if not approaching.
-    """
+    """Linear puck prediction to our defense line (with optional wall reflections)."""
     x0, y0 = int(p0[0]), int(p0[1])
     x1, y1 = int(p1[0]), int(p1[1])
 
@@ -510,6 +515,23 @@ def predict_intercept_on_defense(p0: Tuple[int, int], p1: Tuple[int, int], w: in
     return int(dx), y_px
 
 # =============================================================
+# Attack helpers
+# =============================================================
+
+def puck_in_robot_half(px: int, w: int) -> bool:
+    """True if puck x is on our half (relative to midline)."""
+    mid = midline_x(w)
+    if robot_zone_is_right_eff(w):
+        return px >= mid
+    else:
+        return px <= mid
+
+def push_direction(w: int) -> int:
+    """+1 means push toward +x, -1 toward -x (toward opponent)."""
+    # If robot is on right, opponent is left → push -x
+    return -1 if robot_zone_is_right_eff(w) else 1
+
+# =============================================================
 # UI helpers
 # =============================================================
 
@@ -552,8 +574,6 @@ def draw_margins_and_crease(frame):
         cv2.line(frame, (dx, 0), (dx, h), (0, 140, 255), 2)
         cv2.putText(frame, "DEFENSE LINE", (max(10, dx - 120), 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
-
-
 # =============================================================
 # Main loop
 # =============================================================
@@ -566,6 +586,11 @@ player_x = player_y = 0
 robot_x = robot_y = 0
 last_robot_xy = None
 last_send = 0.0
+
+# Attack state
+puck_half_since: Optional[float] = None
+last_attack_push_time: float = 0.0
+attack_active: bool = False
 
 print("[INFO] Running. Press ESC or 'q' to quit. Press 'p' to toggle mode. 'o' = flip sides, 'f' = camera flip only, 'b' = toggle border ignore.")
 
@@ -582,14 +607,19 @@ while True:
         frame = cv2.flip(frame, 1)
 
     defense_x = defense_x_for_frame(w)
+    midx = midline_x(w)
 
     # --- Detect ---
     puck_det   = detect_puck(frame)
     player_det = detect_blob(frame, player_lower, player_upper, min_radius=26, max_radius=110, min_area=80, circ_thresh=0.15)
     robot_det  = detect_blob(frame, robot_lower,  robot_upper,  min_radius=24, max_radius=100, min_area=70, circ_thresh=0.25)
 
+    if puck_det is not None:
+        puck_x, puck_y = puck_det[0], puck_det[1]
+
     if player_det is not None:
         player_x, player_y = player_det[0], player_det[1]
+
     if robot_det is not None:
         robot_x, robot_y = robot_det[0], robot_det[1]
         last_robot_xy = (robot_x, robot_y)
@@ -604,13 +634,68 @@ while True:
     draw_circles_on_frame(frame, robot_det,  color=(0, 0, 255))   # robot (red/blue)
 
     if not IGNORE_BORDERS:
-        draw_middle_line(frame, midline_x(w))
+        draw_middle_line(frame, midx)
         draw_margins_and_crease(frame)
 
     sent_this_frame = False
 
+    # --- Attack trigger tracking ---
+    now = time.time()
+    if ATTACK_ENABLE and puck_det is not None:
+        if puck_in_robot_half(puck_x, w):
+            if puck_half_since is None:
+                puck_half_since = now
+            # trigger if stayed in half long enough
+            if (now - puck_half_since) >= ATTACK_TRIGGER_SEC:
+                attack_active = True
+        else:
+            puck_half_since = None
+            attack_active = False
+    else:
+        puck_half_since = None
+        attack_active = False
+
+    # --- ATTACK routine (overrides normal movement while active) ---
+    if attack_active and puck_det is not None:
+        # Show attack banner
+        cv2.putText(frame, "ATTACK!", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+        # Approach first if far
+        dx = puck_x - robot_x
+        dy = puck_y - robot_y
+        dist2 = dx*dx + dy*dy
+
+        if dist2 > (APPROACH_DIST_PIX * APPROACH_DIST_PIX):
+            tx, ty = clamp_to_robot_zone(puck_x, puck_y, w, h)
+        else:
+            # Close enough: push toward opponent side
+            dir_push = push_direction(w)
+            target_push_x = puck_x + dir_push * HIT_PUSH_PIX
+            tx, ty = clamp_to_robot_zone(target_push_x, puck_y, w, h)
+
+            # rate-limit push target updates to avoid chattering
+            if now - last_attack_push_time < ATTACK_COOLDOWN_SEC:
+                # hold previous frame's command; skip sending
+                tx, ty = clamp_to_robot_zone(tx, ty, w, h)
+            else:
+                last_attack_push_time = now
+
+        # Draw chosen attack target
+        cv2.circle(frame, (tx, ty), 9, (0, 0, 255), 2)
+        cv2.line(frame, (robot_x, robot_y), (tx, ty), (0, 0, 255), 2)
+
+        # Move
+        d2 = (robot_x - tx) ** 2 + (robot_y - ty) ** 2
+        if d2 > (PIXEL_DEADBAND * PIXEL_DEADBAND):
+            s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
+            out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
+            if now - last_send >= SEND_MIN_INTERVAL:
+                send_data_to_arduino(out_a, out_b)
+                last_send = now
+                sent_this_frame = True
+
     # --- Defense logic (CONTROL_MODE == 'line') ---
-    if CONTROL_MODE == "line" and (puck_det is not None and player_det is not None):
+    if not sent_this_frame and CONTROL_MODE == "line" and (puck_det is not None and player_det is not None):
         # Draw enemy->puck vector
         cv2.line(frame, (player_x, player_y), (puck_x, puck_y), (0, 165, 255), 2)
 
@@ -645,24 +730,22 @@ while True:
         if d2 > (PIXEL_DEADBAND * PIXEL_DEADBAND):
             s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
             out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
-            now = time.time()
             if now - last_send >= SEND_MIN_INTERVAL:
                 send_data_to_arduino(out_a, out_b)
                 last_send = now
                 sent_this_frame = True
 
     # --- Fallback: track puck but X locked to defense line ---
-    if CONTROL_MODE == "puck" and puck_det is not None and not sent_this_frame:
+    if not sent_this_frame and CONTROL_MODE == "puck" and puck_det is not None:
         tx, ty = clamp_to_robot_zone(defense_x, puck_y, w, h)  # x stays on defense line
         s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
         out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
-        now = time.time()
         if now - last_send >= SEND_MIN_INTERVAL:
             send_data_to_arduino(out_a, out_b)
             last_send = now
 
-    status = f"Mode:{CONTROL_MODE}  Opp:{OPPONENT_SIDE}  CamFlip:{CAMERA_MIRROR_X}  InvX:{MOTOR_INVERT_X} InvY:{MOTOR_INVERT_Y}  Puck:{puck_det is not None} Enemy:{player_det is not None} Robot:{robot_det is not None} Borders:{'OFF' if IGNORE_BORDERS else 'ON'}"
-    # --- Prediction trace & overlay ---
+    # --- Prediction trace & overlay (unchanged) ---
+    status = f"Mode:{CONTROL_MODE}  Opp:{OPPONENT_SIDE}  CamFlip:{CAMERA_MIRROR_X}  InvX:{MOTOR_INVERT_X} InvY:{MOTOR_INVERT_Y}  Puck:{puck_det is not None} Enemy:{player_det is not None} Robot:{robot_det is not None} Borders:{'OFF' if IGNORE_BORDERS else 'ON'}  Attack:{attack_active}"
     try:
         h, w = frame.shape[:2]
         pt = extract_xy(puck_det)
@@ -681,9 +764,9 @@ while True:
         pass
 
     cv2.putText(frame, status, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 220, 20), 2, cv2.LINE_AA)
-    print(f"Puck({puck_x:4d},{puck_y:4d})  Robot({robot_x:4d},{robot_y:4d})  Sent:{sent_this_frame}")
+    print(f"Puck({puck_x:4d},{puck_y:4d})  Robot({robot_x:4d},{robot_y:4d})  Attack:{attack_active}  Sent:{sent_this_frame}")
 
-    cv2.imshow("Air Hockey – Defense Line", frame)
+    cv2.imshow("Air Hockey – Defense + Attack", frame)
     key = cv2.waitKey(1) & 0xFF
     if key in (27, ord('q')):  # ESC or q
         break
