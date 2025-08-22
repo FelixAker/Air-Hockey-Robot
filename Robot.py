@@ -44,7 +44,7 @@ IGNORE_BORDERS      = False    # Disable border clamps & visuals for testing
 
 # Auto-attack parameters
 ATTACK_ENABLE        = True
-ATTACK_TRIGGER_SEC   = 3.0     # time puck must stay in our half to trigger attack
+ATTACK_TRIGGER_SEC   = 2.0     # time puck must stay in our half to trigger attack
 APPROACH_DIST_PIX    = 40      # if farther than this from puck, approach first
 HIT_PUSH_PIX         = 80      # when close, push this many px toward opponent side
 ATTACK_COOLDOWN_SEC  = 0.8     # minimum time between push targets to avoid oscillation
@@ -57,20 +57,21 @@ MOTOR_INVERT_Y     = False   # if vertical sense is reversed, toggle with 'y'
 
 # Sides/orientation
 OPPONENT_SIDE       = 'right'   # 'left' if opponent is left in the image, else 'right'
-MIDDLE_LINE_X       = 940       # visual midline x (pixels)
-ROBOT_SIDE_MARGIN   = 140       # how far away from midline our robot must stay
+MIDDLE_LINE_X       = 980       # visual midline x (pixels)
+ROBOT_SIDE_MARGIN   = 20       # how far away from midline our robot must stay
 CAMERA_MIRROR_X     = False     # flip camera image only (no logic flip)
 
 # Safety margins and crease (no-go areas)
-ARENA_MARGIN_X      = 120       # keep away from left/right walls (bigger)
-ARENA_MARGIN_Y      = 140       # keep away from top/bottom rails (bigger)
-GOAL_CREASE_DEPTH   = 260       # depth of the no-go strip in front of a goal (bigger)
+ARENA_MARGIN_X      = 0       # keep away from left/right walls (bigger)
+ARENA_MARGIN_Y      = 100       # keep away from top/bottom rails (bigger)
+GOAL_CREASE_DEPTH   = 100       # depth of the no-go strip in front of a goal (bigger)
 
 # HSV - puck (blue), player (green), robot (orange)
-PUCK_BANDS = [
-    (np.array([100, 120,  60], np.uint8),
-     np.array([125, 255, 255], np.uint8))
-]
+# Yellow puck color range
+lower_puck = np.array([20, 100, 100])   # lower bound (H, S, V)
+upper_puck = np.array([30, 255, 255])   # upper bound (H, S, V)
+
+
 player_lower = np.array([40,  80,  50], np.uint8)
 player_upper = np.array([85, 255, 255], np.uint8)
 robot_lower  = np.array([ 7, 180, 180], np.uint8)
@@ -80,9 +81,14 @@ robot_upper  = np.array([13, 255, 255], np.uint8)
 udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 udp_addr   = ('192.168.4.1', 2222)
 
+HIT_SIDE_OFFSET   = 60   # px to the LEFT of the puck to stage from
+STAGE_REACH_PIX   = 24   # how close to the stage point before we start the push
+
 # =============================================================
 # Serial helpers
 # =============================================================
+
+
 
 def autodetect_serial_port():
     patterns = []
@@ -122,7 +128,7 @@ def send_data_to_arduino(step1, step2):
     if ser is None:
         return
     try:
-        ser.write(f"{step1/3},{step2/3}\n".encode())
+        ser.write(f"{step1/2.5},{step2/2.5}\n".encode())
         print(f"{step1} {step2}")
         resp = ser.readline().decode(errors='ignore').strip()
         if resp:
@@ -135,6 +141,7 @@ def send_data_to_arduino(step1, step2):
 # =============================================================
 
 def open_camera(prefer=(1, 0, 2, 3)):
+
     for idx in prefer:
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
@@ -306,47 +313,27 @@ def predict_enemy_shot_until_boundary(px, py, ex, ey, frame_w, frame_h, goal_mar
 # Detection
 # =============================================================
 
-def detect_puck(frame, bands=PUCK_BANDS, min_radius=14, max_radius=90, use_blue_bias=True):
-    global puck_x, puck_y
+def detect_puck(frame):
+    """Detect the puck in the given frame using HSV color filtering."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    mask = None
-    for low, up in bands:
-        m = cv2.inRange(hsv, low, up)
-        mask = m if mask is None else cv2.bitwise_or(mask, m)
+    # Yellow puck HSV range (tuned for rgba(223,176,1,255))
+    lower = np.array([18, 120, 80], np.uint8)
+    upper = np.array([32, 255, 255], np.uint8)
 
-    if use_blue_bias:
-        b, g, r = cv2.split(frame)
-        dom = (b.astype(np.int16) > (g.astype(np.int16) + 15)) & (b.astype(np.int16) > (r.astype(np.int16) + 15))
-        dom = dom.astype(np.uint8) * 255
-        mask = cv2.bitwise_and(mask, dom)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.medianBlur(mask, 5)
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-
+    # Find contours
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        (x, y), radius = cv2.minEnclosingCircle(largest)
+        if radius > 5:  # filter noise
+            return int(x), int(y), int(radius)
 
-    largest = None
-    max_radius_found = 0
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 40:
-            continue
-        perim = cv2.arcLength(cnt, True)
-        if perim <= 0:
-            continue
-        circularity = 4 * np.pi * area / (perim ** 2)
-        if circularity < 0.3:
-            continue
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
-        if min_radius <= radius <= max_radius and radius > max_radius_found:
-            largest = (int(x), int(y), int(radius))
-            max_radius_found = radius
+    return None
 
-    if largest is not None:
-        puck_x, puck_y = largest[0], largest[1]
-
-    return largest
 
 
 def detect_blob(frame, lower, upper, min_radius=24, max_radius=120, min_area=70, circ_thresh=0.20):
@@ -385,38 +372,69 @@ def draw_circles_on_frame(frame, detection, color=(255, 0, 0)):
 # =============================================================
 # Motion mapping (with HARD CLAMP)
 # =============================================================
+def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h, attack=False):
+    """
+    Distance-based step burst:
+      - Measure pixel distance to target
+      - Map to step burst (small near, large far)
+      - Higher ceiling in attack
+    """
+    # --- Tunables (simple & smooth) ---
+    DEAD_PIX          = max(3, int(PIXEL_DEADBAND))  # don’t chatter when basically there
+    PX_FULL_SPEED     = 120      # pixels where we’re already at ~max burst
+    MIN_BURST_STEPS   = 300      # minimum burst so it visibly moves
+    MAX_BURST_NORMAL  = 3000     # normal ceiling
+    MAX_BURST_ATTACK  = 4000     # bigger pushes in attack
 
-def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h):
-    """
-    CoreXY mapping using actual frame size (w,h).
-    Returns (delta_step1, delta_step2).
-    """
+    # Clamp incoming points to frame
     target_x = int(np.clip(target_x, 0, w - 1))
     target_y = int(np.clip(target_y, 0, h - 1))
     robot_x  = int(np.clip(robot_x,  0, w - 1))
     robot_y  = int(np.clip(robot_y,  0, h - 1))
 
-    target_x_steps = int(np.interp(target_x, [0, w - 1], [0, 8000]))
-    target_y_steps = int(np.interp(target_y, [0, h - 1], [0, 8000]))
-    robot_x_steps  = int(np.interp(robot_x,  [0, w - 1], [0, 8000]))
-    robot_y_steps  = int(np.interp(robot_y,  [0, h - 1], [0, 8000]))
+    # Pixel error
+    dx_px = float(target_x - robot_x)
+    dy_px = float(target_y - robot_y)
+    d_px  = float(np.hypot(dx_px, dy_px))
 
-    target_step1 = target_y_steps - target_x_steps
-    target_step2 = target_y_steps + target_x_steps
-    robot_step1  = robot_y_steps  - robot_x_steps
-    robot_step2  = robot_y_steps  + robot_x_steps
+    # Deadband
+    if d_px <= DEAD_PIX:
+        return 0, 0
 
-    steps1 = target_step1 - robot_step1
-    steps2 = target_step2 - robot_step2
-    if(steps1 >= 0):
-        steps1 = 2000
-    else:
-        steps1 = -2000
-    if (steps2 >= 0):
-        steps2 = 2000
-    else:
-        steps2 = -2000
-    return steps1, steps2
+    # Map pixels -> step burst (smooth tanh curve that saturates near MAX)
+    burst_max = MAX_BURST_ATTACK if attack else MAX_BURST_NORMAL
+    scale = max(1.0, PX_FULL_SPEED)
+    gain  = np.tanh(d_px / scale)          # 0 .. ~1
+    burst = int(MIN_BURST_STEPS + (burst_max - MIN_BURST_STEPS) * gain)
+
+    # Convert pixel direction into CoreXY step direction
+    # 1) pixels -> per-axis steps (use your global X/Y_STEPS_MAX mapping)
+    txs = np.interp(target_x, [0, w - 1], [0, X_STEPS_MAX])
+    tys = np.interp(target_y, [0, h - 1], [0, Y_STEPS_MAX])
+    rxs = np.interp(robot_x,  [0, w - 1], [0, X_STEPS_MAX])
+    rys = np.interp(robot_y,  [0, h - 1], [0, Y_STEPS_MAX])
+
+    # 2) CoreXY mix and errors in step-space
+    t1, t2 = (tys - txs), (tys + txs)
+    r1, r2 = (rys - rxs), (rys + rxs)
+    e1, e2 = (t1 - r1), (t2 - r2)
+    mag = float(np.hypot(e1, e2))
+    if mag < 1e-6:
+        return 0, 0
+
+    # 3) Unit vector in step-space * burst magnitude
+    u1, u2 = (e1 / mag), (e2 / mag)
+    s1 = int(np.round(u1 * burst))
+    s2 = int(np.round(u2 * burst))
+
+    # Guarantee non-zero output when there is error
+    if s1 == 0:
+        s1 = 1 if e1 > 0 else -1
+    if s2 == 0:
+        s2 = 1 if e2 > 0 else -1
+
+    return s1, s2
+
 
 
 # =============================================================
@@ -687,7 +705,7 @@ while True:
         # Move
         d2 = (robot_x - tx) ** 2 + (robot_y - ty) ** 2
         if d2 > (PIXEL_DEADBAND * PIXEL_DEADBAND):
-            s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
+            s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h, True)
             out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
             if now - last_send >= SEND_MIN_INTERVAL:
                 send_data_to_arduino(out_a, out_b)
@@ -728,7 +746,7 @@ while True:
         # Only move if far enough
         d2 = (robot_x - tx) ** 2 + (robot_y - ty) ** 2
         if d2 > (PIXEL_DEADBAND * PIXEL_DEADBAND):
-            s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
+            s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h,False)
             out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
             if now - last_send >= SEND_MIN_INTERVAL:
                 send_data_to_arduino(out_a, out_b)
@@ -738,7 +756,7 @@ while True:
     # --- Fallback: track puck but X locked to defense line ---
     if not sent_this_frame and CONTROL_MODE == "puck" and puck_det is not None:
         tx, ty = clamp_to_robot_zone(defense_x, puck_y, w, h)  # x stays on defense line
-        s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h)
+        s1, s2 = pixel_to_steps(tx, ty, robot_x, robot_y, w, h,False)
         out_a, out_b = (s2, s1) if SWAP_STEPS else (s1, s2)
         if now - last_send >= SEND_MIN_INTERVAL:
             send_data_to_arduino(out_a, out_b)
@@ -792,3 +810,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
