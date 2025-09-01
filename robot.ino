@@ -10,7 +10,7 @@
 
 // Motor behavior parameters
 #define MIN_STEP_DELAY 17
-#define MAX_STEP_DELAY 25
+#define MAX_STEP_DELAY 34
 #define ACCEL_DELAY 1000  // us
 
 // Timers
