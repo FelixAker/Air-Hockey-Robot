@@ -84,3 +84,14 @@ config.txt
 README.md
 docs/demo.gif
 ```
+---
+
+## Controllers
+
+- **Robot.py** — Main controller. Holds an aligned defense line (or “puck” mode that tracks vertically), triggers auto-attack if the puck lingers in robot's half, applies CoreXY mapping and safety clamps and streams step bursts to Arduino over serial.
+
+- **RobotVersion2.py** — Proactive controller. Predicts the puck path and repositions off the line to intercept earlier; uses the same serial protocol and tuning knobs.
+
+- **DefenseOnlyVersion2.py** — Defense only feature of RobotVersion2.py.
+
+
