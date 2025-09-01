@@ -38,13 +38,14 @@ If you see `[ERROR] Camera read failed`, try changing the index in `open_camera(
 
 ## Run
 
-1. Plug in Arduino and camera  
-2. (Optional) create `config.txt`:
+1. Plug in Arduino and camera
+2. Enter the Arduino port number for your device 
+3. (Optional) create `config.txt`:
    ```ini
    [PARAMS]
    FPS=60
    ```
-3. Run:
+4. Run:
    ```bash
    python air_hockey.py
    ```
