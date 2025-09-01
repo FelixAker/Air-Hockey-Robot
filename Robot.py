@@ -40,9 +40,9 @@ Hotkeys
 - b: toggle border ignore (useful for visual debugging only — disables safety clamps!)
 """
 
-# =============================================================
-# Config
-# =============================================================
+
+# Config ----------------
+
 config = configparser.ConfigParser()
 config.read('config.txt')
 
@@ -85,9 +85,9 @@ robot_lower  = np.array([7, 180, 180], np.uint8)
 robot_upper  = np.array([13, 255, 255], np.uint8)
 
 
-# =============================================================
-# Serial helpers
-# =============================================================
+
+# Serial helpers ------------------------
+
 def autodetect_serial_port():
     """
     Try common device patterns to find a connected Arduino on macOS/Linux/Windows.
@@ -150,9 +150,9 @@ def send_data_to_arduino(step1, step2):
         print(f"[Serial Error] {e}")
 
 
-# =============================================================
-# Camera
-# =============================================================
+
+# Camera ---------------------
+
 def open_camera(prefer=(0, 1, 2, 3)):
     """
     Open the first camera index that yields a valid frame and configure 1080p@FPS.
@@ -174,9 +174,9 @@ def open_camera(prefer=(0, 1, 2, 3)):
     raise RuntimeError("No camera produced frames. Check connections and indices.")
 
 
-# =============================================================
-# Zone / boundary helpers (HARD ENFORCEMENT)
-# =============================================================
+
+# Zone / boundary helpers (HARD ENFORCEMENT) ---------------------
+
 def robot_zone_is_right_raw() -> bool:
     """
     True if our robot occupies the RIGHT half of the frame (i.e., opponent is left).
@@ -251,9 +251,8 @@ def clamp_to_robot_zone(x: int, y: int, w: int, h: int) -> tuple[int, int]:
     return x, y
 
 
-# =============================================================
-# Prediction (enemy shot)
-# =============================================================
+
+# Prediction (enemy shot) ------------------------
 def predict_enemy_shot_until_boundary(px, py, ex, ey, frame_w, frame_h, goal_margin=GOAL_MARGIN_PIX, max_bounces=2):
     """
     Predict a straight-line shot from the puck toward the side it's currently moving,
@@ -306,9 +305,9 @@ def predict_enemy_shot_until_boundary(px, py, ex, ey, frame_w, frame_h, goal_mar
     return segments, last_pt
 
 
-# =============================================================
+
 # Detection
-# =============================================================
+
 def detect_puck(frame):
     """
     Locate the (yellow) puck via HSV thresholding + median blur + largest contour.
@@ -376,9 +375,9 @@ def draw_circles_on_frame(frame, detection, color=(255, 0, 0)):
         cv2.circle(frame, (x, y), 3, color, -1)
 
 
-# =============================================================
-# Motion mapping (with HARD CLAMP)
-# =============================================================
+
+# Motion mapping (with HARD CLAMP) -----------
+
 def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h, attack=False):
     """
     Convert pixel error between (robot_x,robot_y) and (target_x,target_y) to a CoreXY
@@ -448,9 +447,8 @@ def pixel_to_steps(target_x, target_y, robot_x, robot_y, w, h, attack=False):
     return s1, s2
 
 
-# =============================================================
-# Prediction helpers
-# =============================================================
+
+# Prediction helpers ---------------
 PUCK_TRACE: deque = deque(maxlen=8)             # Recent puck positions (for velocity estimate)
 PREDICTED_POINT: Optional[Tuple[int, int]] = None  # Cached intercept on defense line
 
@@ -556,9 +554,9 @@ def predict_intercept_on_defense(p0: Tuple[int, int], p1: Tuple[int, int], w: in
     return int(dx), y_px
 
 
-# =============================================================
-# UI helpers
-# =============================================================
+
+# UI helpers -----------------------
+
 def draw_middle_line(frame, x):
     """
     Draw the midline and tick marks; label as the robot boundary (our half limit).
@@ -610,9 +608,9 @@ def draw_margins_and_crease(frame):
         cv2.putText(frame, "DEFENSE LINE", (max(10, dx - 120), 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
 
-# =============================================================
-# Main loop
-# =============================================================
+
+# Main loop --------------------
+
 cap = open_camera()
 
 # Latest known detections (persist between frames to avoid NaNs when momentarily lost)
