@@ -27,6 +27,15 @@ Python vision controller for a CoreXY air-hockey robot. Tracks the **puck**, **o
 
 ---
 
+## Camera Notes
+
+The script tries to open a camera at index `0` by default.  
+On some systems (e.g., when using a phone as webcam), the camera may show up at index `1` or higher.  
+
+If you see `[ERROR] Camera read failed`, try changing the index in `open_camera(prefer=(0,1,2,3))` inside the script.
+
+---
+
 ## Run
 
 1. Plug in Arduino and camera  
